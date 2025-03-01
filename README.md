@@ -6,7 +6,14 @@ This is a Python-based bot designed to perform various tasks, including voice fu
 
 - Play music from various sources (YouTube, Spotify, SoundCloud)
 - Pause, resume, and stop music playback
-- Voice connection management with Lavalink
+- Voice connection management with Lavalink/pomice
+
+
+# Working on:
+- Loop commands
+- last.fm
+- Sharding
+
 
 ## Requirements
 
