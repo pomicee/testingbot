@@ -30,7 +30,7 @@ class MusicBot(commands.Bot):
         """Start the bot."""
         await self._load_extensions()
         await setup_error_handlers(self)
-        await super().start(self.config.TOKEN)
+        await super().start("")
     
     async def _load_extensions(self):
         """Load all extensions."""
