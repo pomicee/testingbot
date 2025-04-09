@@ -1,8 +1,8 @@
 import discord
 import pomice
 import logging
-import asyncio
 import random
+import asyncio
 from discord.ext import commands
 from discord import app_commands
 
@@ -11,29 +11,48 @@ from utils.embeds import (
     success_embed, error_embed, music_embed, 
     queue_embed, now_playing_embed
 )
-from utils.helpers import ensure_voice, is_url, format_time
+from utils.helpers import is_url, format_time
+import aiohttp
 
 logger = logging.getLogger(__name__)
+def ensure_voice(check_playing=False):
+    async def predicate(ctx):
+        if not ctx.author.voice:
+            await ctx.send(embed=error_embed("You must be connected to a voice channel to use this command."))
+            return False
+            
+        if check_playing:
+            player = ctx.bot.node.get_player(ctx.guild.id)
+            if not player or not player.is_playing and not player.is_paused:
+                await ctx.send(embed=error_embed("Nothing is currently playing."))
+                return False
+                
+        return True
+    return commands.check(predicate)
 
 class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.pomice = pomice.NodePool()
         self.looping = {}
-        bot.loop.create_task(self.start_nodes())
+        self.node_ready = False
+        self.player_guilds = {}
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if not self.node_ready:
+            await self.start_nodes()
 
     async def start_nodes(self):
-        await self.bot.wait_until_ready()
-        
         try:
             self.bot.node = await self.pomice.create_node(
                 bot=self.bot,
-                host=self.bot.config.LAVALINK["host"],
-                port=self.bot.config.LAVALINK["port"],
-                password=self.bot.config.LAVALINK["password"],
-                identifier=self.bot.config.LAVALINK["identifier"],
-                secure=self.bot.config.LAVALINK["secure"]
+                host="lava-v4.ajieblogs.eu.org",
+                port=80,
+                password="https://dsc.gg/ajidevserver",
+                identifier="MAIN",
             )
+            self.node_ready = True
             logger.info("Lavalink node is ready!")
         except Exception as error:
             logger.error(f"Failed to initialize Lavalink node: {error}")
@@ -60,392 +79,221 @@ class Music(commands.Cog):
                 player.bound_channel = ctx.channel
                 await player.set_volume(self.bot.config.DEFAULT_VOLUME)
                 player.voice_channel = ctx.author.voice.channel.id
+                player.guild_id = ctx.guild.id 
                 
+                self.player_guilds[player] = ctx.guild.id
                 self.looping[ctx.guild.id] = False
         
         return player
 
-    @commands.hybrid_group(name="queue", description="Manage the music queue")
-    async def queue_cmd(self, ctx):
-        if ctx.invoked_subcommand is None:
-            await self.queue_view(ctx)
-
-    @queue_cmd.command(name="view", description="View the current queue")
-    async def queue_view(self, ctx, page: int = 1):
-        player = await self.get_player(ctx, connect=False)
-        embed = queue_embed(player, player.track, page)
-        await ctx.send(embed=embed)
-
-    @queue_cmd.command(name="clear", description="Clear the queue")
-    async def queue_clear(self, ctx):
-        player = await self.get_player(ctx, connect=False)
-        await player.clear_queue()
-        await ctx.send(embed=success_embed("The music queue has been cleared."))
-
-    @queue_cmd.command(name="shuffle", description="Shuffle the queue")
-    async def queue_shuffle(self, ctx):
-        player = await self.get_player(ctx, connect=False)
-        
-        if player.queue.empty():
-            await ctx.send(embed=error_embed("The queue is empty."))
-            return
-        
-        queue_items = player.queue_list
-        random.shuffle(queue_items)
-        
-        player.queue = asyncio.Queue()
-        for item in queue_items:
-            await player.queue.put(item)
-        
-        await ctx.send(embed=success_embed("The music queue has been shuffled."))
-
-    @queue_cmd.command(name="remove", description="Remove a track from the queue")
-    async def queue_remove(self, ctx, position: int):
-        player = await self.get_player(ctx, connect=False)
-        queue_items = player.queue_list
-        
-        if not queue_items or position < 1 or position > len(queue_items):
-            await ctx.send(embed=error_embed("Invalid position."))
-            return
-        
-        removed_track = queue_items.pop(position - 1)
-        
-        player.queue = asyncio.Queue()
-        for track in queue_items:
-            await player.queue.put(track)
-        
-        await ctx.send(embed=success_embed(f"Removed **{removed_track.title}** from the queue."))
-
-    @queue_cmd.command(name="move", description="Move a track in the queue")
-    async def queue_move(self, ctx, position: int, new_position: int):
-        player = await self.get_player(ctx, connect=False)
-        queue_items = player.queue_list
-        
-        if not queue_items or position < 1 or position > len(queue_items) or new_position < 1 or new_position > len(queue_items):
-            await ctx.send(embed=error_embed("Invalid positions."))
-            return
-        
-        track = queue_items.pop(position - 1)
-        queue_items.insert(new_position - 1, track)
-        
-        player.queue = asyncio.Queue()
-        for item in queue_items:
-            await player.queue.put(item)
-        
-        await ctx.send(embed=success_embed(f"Moved **{track.title}** to position {new_position}."))
-
-    @commands.hybrid_command(name="play", description="Play a track or playlist")
+    @commands.hybrid_command(name="play", description="Play a song or add it to the queue")
+    @app_commands.describe(query="Song name or URL to play")
+    @ensure_voice()
     async def play(self, ctx, *, query: str):
+        """Play a song from YouTube, Spotify, or other supported platforms."""
         await ctx.defer()
+        
         player = await self.get_player(ctx)
+        player.message = ctx.message
         
         if not query:
             if player.is_paused:
-                await player.set_pause(False)
-                await ctx.send(embed=success_embed("Resumed playback."))
-                return
-            else:
-                await ctx.send(embed=error_embed("Please provide a search query or URL."))
-                return
-        
-        search_query = query
-        if not is_url(query):
-            search_query = f"ytsearch:{query}"
-        
+                await player.resume()
+                return await ctx.send(embed=success_embed("Resumed playback"))
+            return await ctx.send(embed=error_embed("Please provide a song name or URL"))
+            
         try:
-            result = await player.node.get_tracks(query=search_query, ctx=ctx)
-        except Exception as e:
-            logger.error(f"Error searching for tracks: {e}")
-            await ctx.send(embed=error_embed("An error occurred while searching. Please try again."))
-            return
-            
-        if not result:
-            await ctx.send(embed=error_embed("No results found."))
-            return
-
-        player.message = ctx.message
-        
-        if isinstance(result, pomice.Playlist):
-            tracks = result.tracks
-            
-            for track in tracks:
-                await player.insert(track)
+            if not is_url(query):
+                query = f"ytsearch:{query}"
                 
-            await ctx.send(
-                embed=success_embed(f"Added **{len(tracks)}** tracks from playlist **{result.name}** to the queue.")
-            )
-        else:
-            track = result[0]
-            await player.insert(track)
+            results = await player.get_tracks(query)
             
-            position = player.queue.qsize()
-            
-            if player.is_playing:
-                await ctx.send(
-                    embed=success_embed(
-                        f"Added **[{track.title}]({track.uri})** to position #{position} in the queue."
-                    )
-                )
+            if not results:
+                return await ctx.send(embed=error_embed(f"No results found for: {query}"))
+            if hasattr(results, 'tracks') and results.tracks:
+                tracks = results.tracks
+                playlist_name = getattr(results, 'name', 'Playlist')
+                
+                for track in tracks:
+                    track.requester = ctx.author
+                    await player.queue.put(track)
+                    
+                await ctx.send(embed=success_embed(f"Added {len(tracks)} tracks from playlist: **{playlist_name}**"))
             else:
-                await ctx.send(
-                    embed=success_embed(
-                        f"Added **[{track.title}]({track.uri})** to the queue."
-                    )
-                )
-
-        if not player.is_playing and not player.waiting:
-            await self.process_next_track(player, ctx.author)
-
-    @commands.hybrid_command(name="playnext", description="Add a track to the top of the queue")
-    async def playnext(self, ctx, *, query: str):
-        await ctx.defer()
-        player = await self.get_player(ctx)
-        
-        search_query = query
-        if not is_url(query):
-            search_query = f"ytsearch:{query}"
-        
-        try:
-            result = await player.node.get_tracks(query=search_query, ctx=ctx)
+                track = results[0]
+                track.requester = ctx.author
+                await player.queue.put(track)
+                await ctx.send(embed=music_embed(track, ctx.author))
+                    
+            if not player.is_playing and not player.waiting:
+                await self.process_next_track(player, ctx.author)
+                
         except Exception as e:
-            logger.error(f"Error searching for tracks: {e}")
-            await ctx.send(embed=error_embed("An error occurred while searching. Please try again."))
-            return
-            
-        if not result:
-            await ctx.send(embed=error_embed("No results found."))
-            return
+            logger.error(f"Error in play command: {e}")
+            await ctx.send(embed=error_embed(f"An error occurred: {str(e)}"))
 
-        player.message = ctx.message
+    @commands.hybrid_command(name="queue", description="Display the music queue")
+    @ensure_voice()
+    async def queue(self, ctx):
+        """Display the current music queue."""
+        player = await self.get_player(ctx, connect=False)
         
-        if isinstance(result, pomice.Playlist):
-            tracks = result.tracks
+        if player.queue.empty() and not player.is_playing:
+            return await ctx.send(embed=error_embed("The queue is empty and nothing is playing."))
             
-            current_queue = player.queue_list
-            player.queue = asyncio.Queue()
-            
-            for track in tracks:
-                await player.queue.put(track)
-                
-            for track in current_queue:
-                await player.queue.put(track)
-                
-            await ctx.send(
-                embed=success_embed(f"Added **{len(tracks)}** tracks from playlist **{result.name}** to the front of the queue.")
-            )
-        else:
-            track = result[0]
-            
-            current_queue = player.queue_list
-            player.queue = asyncio.Queue()
-            
-            await player.queue.put(track)
-            
-            for item in current_queue:
-                await player.queue.put(item)
-                
-            await ctx.send(
-                embed=success_embed(
-                    f"Added **[{track.title}]({track.uri})** to the front of the queue."
-                )
-            )
+        await ctx.send(embed=queue_embed(player, ctx.guild))
 
-        if not player.is_playing and not player.waiting:
-            await self.process_next_track(player, ctx.author)
-
-    @commands.hybrid_command(name="pause", description="Pause the current track")
+    @commands.hybrid_command(name="pause", description="Pause the current song")
+    @ensure_voice()
     async def pause(self, ctx):
+        """Pause the currently playing song."""
         player = await self.get_player(ctx, connect=False)
         
         if not player.is_playing:
-            await ctx.send(embed=error_embed("Nothing is playing right now."))
-            return
+            return await ctx.send(embed=error_embed("Nothing is playing."))
             
         if player.is_paused:
-            await ctx.send(embed=error_embed("The player is already paused."))
-            return
+            return await ctx.send(embed=error_embed("The player is already paused."))
             
-        await player.set_pause(True)
-        await ctx.send(embed=success_embed("Paused the player."))
+        await player.pause()
+        await ctx.send(embed=success_embed("Paused playback"))
 
-    @commands.hybrid_command(name="resume", description="Resume the current track")
+    @commands.hybrid_command(name="resume", description="Resume the current song")
+    @ensure_voice()
     async def resume(self, ctx):
+        """Resume the currently paused song."""
         player = await self.get_player(ctx, connect=False)
         
-        if not player.is_playing:
-            await ctx.send(embed=error_embed("Nothing is playing right now."))
-            return
+        if not player.is_playing and not player.is_paused:
+            return await ctx.send(embed=error_embed("Nothing is playing."))
             
         if not player.is_paused:
-            await ctx.send(embed=error_embed("The player is not paused."))
-            return
+            return await ctx.send(embed=error_embed("The player is not paused."))
             
-        await player.set_pause(False)
-        await ctx.send(embed=success_embed("Resumed the player."))
+        await player.resume()
+        await ctx.send(embed=success_embed("Resumed playback"))
 
-    @commands.hybrid_command(name="skip", description="Skip the current track")
-    async def skip(self, ctx):
+    @commands.hybrid_command(name="volume", description="Change the volume (0-100)")
+    @app_commands.describe(volume="Volume level (0-100)")
+    @ensure_voice()
+    async def volume(self, ctx, volume: int = None):
+        """Change the volume of the player (0-100)."""
         player = await self.get_player(ctx, connect=False)
         
-        if not player.is_playing:
-            await ctx.send(embed=error_embed("Nothing is playing right now."))
-            return
+        if volume is None:
+            return await ctx.send(embed=success_embed(f"Current volume: **{player.volume}%**"))
             
-        await player.stop()
-        await ctx.send(embed=success_embed("Skipped the current track."))
-
-    @commands.hybrid_command(name="stop", description="Stop playback and clear the queue")
-    async def stop(self, ctx):
-        player = await self.get_player(ctx, connect=False)
-        
-        player.queue = asyncio.Queue()
-        await player.stop()
-        
-        await ctx.send(embed=success_embed("Stopped playback and cleared the queue."))
-
-    @commands.hybrid_command(name="seek", description="Seek to a position in the current track")
-    async def seek(self, ctx, position: str):
-        player = await self.get_player(ctx, connect=False)
-        
-        if not player.is_playing:
-            await ctx.send(embed=error_embed("Nothing is playing right now."))
-            return
-            
-        if not player.track.is_seekable:
-            await ctx.send(embed=error_embed("This track cannot be seeked."))
-            return
-            
-        seconds = 0
-        
-        if ":" in position:
-            parts = position.split(":")
-            if len(parts) == 2:
-                seconds = int(parts[0]) * 60 + int(parts[1])
-            elif len(parts) == 3:
-                seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-        else:
-            try:
-                seconds = int(position)
-            except ValueError:
-                await ctx.send(embed=error_embed("Invalid position format. Use seconds or MM:SS or HH:MM:SS."))
-                return
-                
-        milliseconds = seconds * 1000
-        
-        track_length = player.track.length
-        if milliseconds > track_length:
-            await ctx.send(embed=error_embed(f"The track is only {format_time(track_length/1000)} long."))
-            return
-            
-        await player.seek(milliseconds)
-        await ctx.send(embed=success_embed(f"Seeked to {format_time(seconds)}."))
-
-    @commands.hybrid_command(name="volume", description="Set the player volume")
-    async def volume(self, ctx, volume: int):
-        player = await self.get_player(ctx, connect=False)
-        
-        if volume < 0 or volume > 150:
-            await ctx.send(embed=error_embed("Volume must be between 0 and 150."))
-            return
+        if not 0 <= volume <= 100:
+            return await ctx.send(embed=error_embed("Volume must be between 0 and 100"))
             
         await player.set_volume(volume)
-        await ctx.send(embed=success_embed(f"Set volume to **{volume}%**."))
-
-    @commands.hybrid_command(name="now", description="Show the currently playing track")
-    async def now(self, ctx):
+        await ctx.send(embed=success_embed(f"Set volume to **{volume}%**"))
+    
+    @commands.hybrid_command(name="skip", description="Skip the current song")
+    @ensure_voice()
+    async def skip(self, ctx):
+        """Skip the currently playing song."""
         player = await self.get_player(ctx, connect=False)
         
         if not player.is_playing:
-            await ctx.send(embed=error_embed("Nothing is playing right now."))
-            return
+            return await ctx.send(embed=error_embed("Nothing is playing."))
             
-        embed = now_playing_embed(player.track, ctx.author)
-        
-        position = player.position
-        duration = player.track.length
-        
-        bar_length = 20
-        progress = int(bar_length * (position / duration)) if duration > 0 else 0
-        
-        progress_bar = "▬" * progress + "🔘" + "▬" * (bar_length - progress - 1)
-        
-        current_position = format_time(position / 1000)
-        total_duration = format_time(duration / 1000)
-        
-        embed.add_field(
-            name="Progress",
-            value=f"{current_position} {progress_bar} {total_duration}",
-            inline=False
-        )
-        
-        await ctx.send(embed=embed)
+        await player.stop()
+        await ctx.send(embed=success_embed("Skipped the current track"))
 
-    @commands.hybrid_command(name="loop", description="Toggle track looping")
-    async def loop(self, ctx):
+    @commands.hybrid_command(name="stop", description="Stop playback and clear the queue")
+    @ensure_voice()
+    async def stop(self, ctx):
+        """Stop playback and clear the queue."""
         player = await self.get_player(ctx, connect=False)
-        guild_id = ctx.guild.id
         
-        self.looping[guild_id] = not self.looping.get(guild_id, False)
-        player.loop = self.looping[guild_id]
-        
-        status = "enabled" if self.looping[guild_id] else "disabled"
-        await ctx.send(embed=success_embed(f"Track looping {status}."))
+        player.queue.clear()
+        await player.stop()
+        await ctx.send(embed=success_embed("Stopped playback and cleared the queue"))
 
-    @commands.hybrid_command(name="disconnect", description="Disconnect from the voice channel")
+    @commands.hybrid_command(name="nowplaying", aliases=["np"], description="Show the currently playing song")
+    @ensure_voice()
+    async def nowplaying(self, ctx):
+        """Display information about the currently playing song."""
+        player = await self.get_player(ctx, connect=False)
+        
+        if not player.is_playing:
+            return await ctx.send(embed=error_embed("Nothing is playing."))
+            
+        await ctx.send(embed=now_playing_embed(player.current, player.current.requester or ctx.author))
+
+    @commands.hybrid_command(name="shuffle", description="Shuffle the music queue")
+    @ensure_voice()
+    async def shuffle(self, ctx):
+        """Shuffle the songs in the queue."""
+        player = await self.get_player(ctx, connect=False)
+        
+        if player.queue.empty():
+            return await ctx.send(embed=error_embed("The queue is empty."))
+        queue_list = list(player.queue._queue)
+        random.shuffle(queue_list)
+        player.queue.clear()
+        for track in queue_list:
+            await player.queue.put(track)
+            
+        await ctx.send(embed=success_embed(f"Shuffled **{len(queue_list)}** tracks in the queue"))
+
+    @commands.hybrid_command(name="loop", description="Toggle loop mode")
+    @ensure_voice()
+    async def loop(self, ctx):
+        """Toggle song looping on or off."""
+        player = await self.get_player(ctx, connect=False)
+        
+        if not ctx.guild.id in self.looping:
+            self.looping[ctx.guild.id] = False
+            
+        self.looping[ctx.guild.id] = not self.looping[ctx.guild.id]
+        status = "enabled" if self.looping[ctx.guild.id] else "disabled"
+        
+        await ctx.send(embed=success_embed(f"Loop mode is now **{status}**"))
+    
+    @commands.hybrid_command(name="disconnect", aliases=["dc", "leave"], description="Disconnect the bot from voice")
+    @ensure_voice()
     async def disconnect(self, ctx):
+        """Disconnect the bot from the voice channel."""
         player = await self.get_player(ctx, connect=False)
         
         await player.teardown()
-        self.looping[ctx.guild.id] = False
-        
-        await ctx.send(embed=success_embed("Disconnected from the voice channel."))
-
-    @commands.hybrid_command(name="lyrics", description="Search for lyrics of the current or specified song")
-    async def lyrics(self, ctx, *, query: str = None):
-        player = await self.get_player(ctx, connect=False) if not query else None
-        
-        if not query and not player.is_playing:
-            await ctx.send(embed=error_embed("Nothing is playing and no search query was provided."))
-            return
+        if player in self.player_guilds:
+            del self.player_guilds[player]
             
-        search_query = query if query else player.track.title
+        await ctx.send(embed=success_embed("Disconnected from voice channel"))
+
+    @commands.hybrid_command(name="seek", description="Seek to a position in the current song")
+    @app_commands.describe(position="Position to seek to (in seconds)")
+    @ensure_voice()
+    async def seek(self, ctx, position: int):
+        """Seek to a specific position in the current song (in seconds)."""
+        player = await self.get_player(ctx, connect=False)
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"https://api.lyrics.ovh/v1/{search_query.split(' - ')[0]}/{search_query.split(' - ')[1] if ' - ' in search_query else search_query}",
-                    timeout=10
-                ) as response:
-                    if response.status != 200:
-                        await ctx.send(embed=error_embed(f"No lyrics found for {search_query}."))
-                        return
-                        
-                    data = await response.json()
-                    lyrics = data["lyrics"]
-                    
-                    if len(lyrics) > 4000:
-                        lyrics = lyrics[:4000] + "..."
-                        
-                    embed = music_embed(
-                        title=f"Lyrics for {search_query}",
-                        description=lyrics
-                    )
-                    
-                    await ctx.send(embed=embed)
-        except Exception as e:
-            logger.error(f"Error fetching lyrics: {e}")
-            await ctx.send(embed=error_embed(f"An error occurred while fetching lyrics for {search_query}."))
+        if not player.is_playing:
+            return await ctx.send(embed=error_embed("Nothing is playing."))
+            
+        if not 0 <= position <= (player.current.length / 1000):
+            return await ctx.send(embed=error_embed(f"Position must be between 0 and {int(player.current.length / 1000)} seconds"))
+            
+        position_ms = position * 1000
+        await player.seek(position_ms)
+        
+        formatted_position = format_time(position_ms)
+        await ctx.send(embed=success_embed(f"Seeked to **{formatted_position}**"))
 
     async def process_next_track(self, player, user):
-        if player.queue.empty():
-            return
-            
-        if player.waiting:
+        if player.is_playing or player.waiting:
             return
             
         player.waiting = True
         
         try:
+            if player.queue.empty():
+                player.waiting = False
+                return
+                
             track = await player.queue.get()
             await player.play(track)
             
@@ -461,30 +309,43 @@ class Music(commands.Cog):
 
     @commands.Cog.listener()
     async def on_pomice_track_end(self, player, track, reason):
-        guild_id = int(player.guild_id)
+        guild_id = None
         
-        if self.looping.get(guild_id, False):
-            await player.queue.put(track)
+        if player in self.player_guilds:
+            guild_id = self.player_guilds[player]
+        elif hasattr(player, 'guild_id'):
+            guild_id = player.guild_id
             
-        ctx = None
-        if player.message:
-            ctx = await self.bot.get_context(player.message)
+        if guild_id is None:
+            logger.warning("Could not determine guild_id in on_pomice_track_end")
+            return
+           
+        if reason == "FINISHED":
+            if self.looping.get(guild_id, False):
+                await player.queue.put(track)
             
-        if ctx:
-            await self.process_next_track(player, ctx.author)
+            user = None
+            ctx = None
+            if player.message:
+                ctx = await self.bot.get_context(player.message)
+                if ctx:
+                    user = ctx.author
+            
+            if not user and hasattr(player, 'bound_channel'):
+                user = self.bot.user
+                
+            await self.process_next_track(player, user or self.bot.user)
 
     @commands.Cog.listener()
     async def on_pomice_track_stuck(self, player, track, threshold):
         if player.bound_channel:
             await player.bound_channel.send(embed=error_embed("The track got stuck. Skipping to the next track."))
-            
         await player.stop()
 
     @commands.Cog.listener()
     async def on_pomice_track_exception(self, player, track, error):
         if player.bound_channel:
             await player.bound_channel.send(embed=error_embed(f"An error occurred while playing the track: {error}"))
-            
         await player.stop()
 
     @commands.Cog.listener()
@@ -495,6 +356,8 @@ class Music(commands.Cog):
         if before.channel and not after.channel:
             player = self.bot.node.get_player(member.guild.id)
             if player:
+                if player in self.player_guilds:
+                    del self.player_guilds[player]
                 await player.teardown()
 
 async def setup(bot):
